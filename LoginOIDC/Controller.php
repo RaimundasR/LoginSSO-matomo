@@ -336,33 +336,66 @@ class Controller extends \Piwik\Plugin\Controller
         }
     }
 
+    // private function addRoleWithPermissions(string $username, string $role)
+    // {
+    //     // Map OIDC roles to Matomo access roles
+    //     $permissionsMap = [
+    //         'administrator' => 'admin',
+    //         'editor' => 'write',
+    //         'reader' => 'view',
+    //     ];
+    
+    //     $role = strtolower($role);
+    //     if (!isset($permissionsMap[$role])) {
+    //         throw new Exception("Invalid role: $role");
+    //     }
+    
+    //     $matomoRole = $permissionsMap[$role];
+    
+    //     // Log role assignment
+    //     error_log("Assigning Matomo role: $matomoRole for user: $username");
+    
+    //     // Insert or update the user's access in the matomo_access table
+    //     $sql = "INSERT INTO " . Common::prefixTable("access") . " (login, idsite, access)
+    //             VALUES (?, ?, ?)
+    //             ON DUPLICATE KEY UPDATE access = VALUES(access)";
+        
+    //     // Assume idsite is 1 for the current site (adjust as needed)
+    //     $idsite = 1;
+    
+    //     try {
+    //         Db::query($sql, [$username, $idsite, $matomoRole]);
+    //         error_log("Role assigned successfully for user: $username with access: $matomoRole");
+    //     } catch (Exception $e) {
+    //         error_log("Failed to assign role for user: $username. Error: " . $e->getMessage());
+    //         throw $e;
+    //     }
+    // }
+
     private function addRoleWithPermissions(string $username, string $role)
     {
-        // Map OIDC roles to Matomo access roles
         $permissionsMap = [
             'administrator' => 'admin',
             'editor' => 'write',
             'reader' => 'view',
         ];
-    
+
         $role = strtolower($role);
         if (!isset($permissionsMap[$role])) {
             throw new Exception("Invalid role: $role");
         }
-    
+
         $matomoRole = $permissionsMap[$role];
-    
-        // Log role assignment
-        error_log("Assigning Matomo role: $matomoRole for user: $username");
-    
-        // Insert or update the user's access in the matomo_access table
+        $idsite = 1; // Adjust if dynamic site ID is required
+
+        // Log the role mapping
+        error_log("User: $username, Role: $role, Matomo Role: $matomoRole, Site ID: $idsite");
+
+        // Insert or update the matomo_access table
         $sql = "INSERT INTO " . Common::prefixTable("access") . " (login, idsite, access)
                 VALUES (?, ?, ?)
                 ON DUPLICATE KEY UPDATE access = VALUES(access)";
         
-        // Assume idsite is 1 for the current site (adjust as needed)
-        $idsite = 1;
-    
         try {
             Db::query($sql, [$username, $idsite, $matomoRole]);
             error_log("Role assigned successfully for user: $username with access: $matomoRole");
@@ -371,7 +404,8 @@ class Controller extends \Piwik\Plugin\Controller
             throw $e;
         }
     }
-    
+
+        
 
     /**
      * Determine if all the required settings have been setup.
