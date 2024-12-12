@@ -338,8 +338,9 @@ class Controller extends \Piwik\Plugin\Controller
 
     private function addRoleWithPermissions(string $username, string $role)
     {
+        // Map OIDC roles to Matomo access roles
         $permissionsMap = [
-            'administrator' => 'superuser',
+            'administrator' => 'admin',
             'editor' => 'write',
             'reader' => 'view',
         ];
@@ -358,9 +359,17 @@ class Controller extends \Piwik\Plugin\Controller
         $sql = "INSERT INTO " . Common::prefixTable("access") . " (login, idsite, access)
                 VALUES (?, ?, ?)
                 ON DUPLICATE KEY UPDATE access = VALUES(access)";
-        Db::query($sql, [$username, 'all', $matomoRole]);
+        
+        // Assume idsite is 1 for the current site (adjust as needed)
+        $idsite = 1;
     
-        error_log("Role assigned successfully for user: $username");
+        try {
+            Db::query($sql, [$username, $idsite, $matomoRole]);
+            error_log("Role assigned successfully for user: $username with access: $matomoRole");
+        } catch (Exception $e) {
+            error_log("Failed to assign role for user: $username. Error: " . $e->getMessage());
+            throw $e;
+        }
     }
     
 
