@@ -258,13 +258,15 @@ class Controller extends \Piwik\Plugin\Controller
 
         // Normalize and validate role
         $role = !empty($result->role) ? strtolower(trim($result->role)) : 'reader'; // Default to 'reader' if role is missing
+        error_log("Extracted role for user {$result->email}: $role");
+
+        // Validate against the allowed roles
         $validRoles = ['administrator', 'editor', 'reader'];
         if (!in_array($role, $validRoles)) {
             $role = 'reader'; // Fallback to default if role is invalid
         }
-        // Log the assigned role for debugging
-        error_log("Assigned role: " . $role);
-        
+        error_log("Validated role for user {$result->email}: $role");
+
         $user = $this->getUserByRemoteId("oidc", $providerUserId);
 
         if (empty($user)) {
@@ -379,18 +381,18 @@ class Controller extends \Piwik\Plugin\Controller
             'editor' => 'write',
             'reader' => 'view',
         ];
-
+    
         $role = strtolower($role);
         if (!isset($permissionsMap[$role])) {
             throw new Exception("Invalid role: $role");
         }
-
+    
         $matomoRole = $permissionsMap[$role];
         $idsite = 1; // Adjust if dynamic site ID is required
-
+    
         // Log the role mapping
-        error_log("User: $username, Role: $role, Matomo Role: $matomoRole, Site ID: $idsite");
-
+        error_log("Mapping role for user $username: OIDC Role - $role, Matomo Role - $matomoRole");
+    
         // Insert or update the matomo_access table
         $sql = "INSERT INTO " . Common::prefixTable("access") . " (login, idsite, access)
                 VALUES (?, ?, ?)
@@ -404,8 +406,7 @@ class Controller extends \Piwik\Plugin\Controller
             throw $e;
         }
     }
-
-        
+    
 
     /**
      * Determine if all the required settings have been setup.
