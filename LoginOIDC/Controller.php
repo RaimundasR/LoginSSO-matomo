@@ -177,10 +177,11 @@ class Controller extends \Piwik\Plugin\Controller
 
 
     /**
-     * Redirect to the authorize url of the remote oauth service.
+     * Handle callback from oauth service. 
+     * Verify callback code, exchange for authorization token and fetch userinfo.
      *
      * @return void
-    */
+     */
     public function callback()
     {
         error_log("LoginOIDC: Starting callback process...");
@@ -188,13 +189,13 @@ class Controller extends \Piwik\Plugin\Controller
         try {
             $settings = new \Piwik\Plugins\LoginOIDC\SystemSettings();
             if (!$this->isPluginSetup($settings)) {
-                throw new Exception("Plugin is not configured properly.");
+                throw new Exception("LoginOIDC plugin is not properly configured.");
             }
 
             // Validate state parameter
             $receivedState = Request::fromGet()->getStringParameter("state");
             if ($_SESSION["loginoidc_state"] !== $receivedState) {
-                throw new Exception("State mismatch. Expected: {$_SESSION["loginoidc_state"]}, Received: $receivedState");
+                throw new Exception("State mismatch. Expected: {$_SESSION[\"loginoidc_state\"]}, Received: $receivedState");
             }
             unset($_SESSION["loginoidc_state"]);
 
@@ -205,6 +206,7 @@ class Controller extends \Piwik\Plugin\Controller
             }
 
             // Token exchange
+            error_log("LoginOIDC: Exchanging token...");
             $data = [
                 "client_id" => $settings->clientId->getValue(),
                 "client_secret" => $settings->clientSecret->getValue(),
@@ -214,7 +216,6 @@ class Controller extends \Piwik\Plugin\Controller
             ];
             $dataString = http_build_query($data);
 
-            error_log("LoginOIDC: Exchanging token...");
             $curl = curl_init();
             curl_setopt($curl, CURLOPT_POST, 1);
             curl_setopt($curl, CURLOPT_POSTFIELDS, $dataString);
@@ -235,7 +236,7 @@ class Controller extends \Piwik\Plugin\Controller
 
             $result = json_decode($response, true);
             if (empty($result['access_token'])) {
-                throw new Exception("Access token is missing in the response.");
+                throw new Exception("Access token is missing in the token exchange response.");
             }
 
             $_SESSION['loginoidc_idtoken'] = $result['id_token'] ?? null;
@@ -260,7 +261,9 @@ class Controller extends \Piwik\Plugin\Controller
             }
 
             $userInfo = json_decode($response, true);
-            $userinfoId = $settings->userinfoId->getValue();
+            error_log("LoginOIDC: User info response: " . json_encode($userInfo));
+
+            $userinfoId = $settings->userinfoId->getValue() ?? 'preferred_username';
             $username = $userInfo[$userinfoId] ?? null;
 
             if (empty($username)) {
@@ -270,16 +273,24 @@ class Controller extends \Piwik\Plugin\Controller
 
             // Extract roles from Keycloak claims
             error_log("LoginOIDC: Extracting roles...");
-            $roles = $userInfo['dot-jenkins-bot-authorisation'] ?? [];
-            $role = $this->mapRolesToMatomoRole($roles);
+            $roles = $userInfo['roles'] ?? $userInfo['groups'] ?? [];
+            if (empty($roles)) {
+                error_log("LoginOIDC: No roles found in Keycloak claims. Response: " . json_encode($userInfo));
+                throw new Exception("No roles found in Keycloak claims.");
+            }
 
-            error_log("LoginOIDC: Username: $username, Keycloak Roles: " . json_encode($roles));
-            error_log("LoginOIDC: Mapped Matomo Role: $role");
+            $role = $this->mapRoles($roles);
+            if (!$role) {
+                error_log("LoginOIDC: No valid role mapping found for roles: " . json_encode($roles));
+                throw new Exception("No valid role mapping found for user.");
+            }
 
-            // Assign the role in the Matomo access table
+            error_log("LoginOIDC: Username: $username, Mapped Role: $role");
+
+            // Assign role to user
             $this->addRoleWithPermissions($username, $role);
 
-            // Check if the user exists in Matomo
+            // Handle user login or signup
             $user = $this->getUserByRemoteId("oidc", $username);
 
             if (empty($user)) {
@@ -303,12 +314,10 @@ class Controller extends \Piwik\Plugin\Controller
                 }
             }
         } catch (Exception $e) {
-            error_log("LoginOIDC: Error during callback - " . $e->getMessage());
+            error_log("LoginOIDC: Callback failed - " . $e->getMessage());
             throw $e;
         }
     }
-
-
 
     /**
      * Fetch user role from external JSON source.
