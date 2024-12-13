@@ -146,7 +146,7 @@ class Controller extends \Piwik\Plugin\Controller
      * Redirect to the authorize url of the remote oauth service.
      *
      * @return void
-     */
+    */
     public function callback()
     {
         error_log("LoginOIDC: Starting callback process...");
@@ -158,18 +158,19 @@ class Controller extends \Piwik\Plugin\Controller
             }
 
             // Validate state parameter
-            $state = Request::fromGet()->getStringParameter("state");
-            if ($_SESSION["loginoidc_state"] !== $state) {
-                throw new Exception("State mismatch error during OIDC callback.");
+            $receivedState = Request::fromGet()->getStringParameter("state");
+            if ($_SESSION["loginoidc_state"] !== $receivedState) {
+                throw new Exception("State mismatch. Expected: {$_SESSION["loginoidc_state"]}, Received: $receivedState");
             }
             unset($_SESSION["loginoidc_state"]);
 
+            // Validate provider
             $provider = Request::fromGet()->getStringParameter("provider");
             if ($provider !== "oidc") {
                 throw new Exception("Unknown provider received: $provider");
             }
 
-            // Exchange token
+            // Token exchange
             $data = [
                 "client_id" => $settings->clientId->getValue(),
                 "client_secret" => $settings->clientSecret->getValue(),
@@ -177,51 +178,82 @@ class Controller extends \Piwik\Plugin\Controller
                 "redirect_uri" => $this->getRedirectUri(),
                 "grant_type" => "authorization_code",
             ];
-            $response = $this->makeHttpPostRequest($settings->tokenUrl->getValue(), $data);
-            $result = json_decode($response, true);
+            $dataString = http_build_query($data);
 
-            if (empty($result['access_token'])) {
-                throw new Exception("Access token is missing in the token exchange response.");
+            error_log("LoginOIDC: Exchanging token...");
+            $curl = curl_init();
+            curl_setopt($curl, CURLOPT_POST, 1);
+            curl_setopt($curl, CURLOPT_POSTFIELDS, $dataString);
+            curl_setopt($curl, CURLOPT_HTTPHEADER, [
+                "Content-Type: application/x-www-form-urlencoded",
+                "Accept: application/json",
+            ]);
+            curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($curl, CURLOPT_URL, $settings->tokenUrl->getValue());
+            $response = curl_exec($curl);
+            $httpCode = curl_getinfo($curl, CURLINFO_HTTP_CODE);
+            curl_close($curl);
+
+            if ($httpCode !== 200) {
+                error_log("LoginOIDC: Token exchange failed. HTTP Code: $httpCode, Response: $response");
+                throw new Exception("Token exchange failed. HTTP Code: $httpCode");
             }
+
+            $result = json_decode($response, true);
+            if (empty($result['access_token'])) {
+                throw new Exception("Access token is missing in the response.");
+            }
+
+            $_SESSION['loginoidc_idtoken'] = $result['id_token'] ?? null;
+            $_SESSION['loginoidc_auth'] = true;
 
             // Fetch user info
-            $userInfoResponse = $this->makeHttpGetRequest(
-                $settings->userinfoUrl->getValue(),
-                ["Authorization: Bearer " . $result['access_token'], "Accept: application/json"]
-            );
-            $userInfo = json_decode($userInfoResponse, true);
+            error_log("LoginOIDC: Fetching user info...");
+            $curl = curl_init();
+            curl_setopt($curl, CURLOPT_HTTPHEADER, [
+                "Authorization: Bearer " . $result['access_token'],
+                "Accept: application/json",
+            ]);
+            curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($curl, CURLOPT_URL, $settings->userinfoUrl->getValue());
+            $response = curl_exec($curl);
+            $httpCode = curl_getinfo($curl, CURLINFO_HTTP_CODE);
+            curl_close($curl);
 
-            if (!$userInfo || !is_array($userInfo)) {
-                throw new Exception("Invalid user info response.");
+            if ($httpCode !== 200) {
+                error_log("LoginOIDC: User info request failed. HTTP Code: $httpCode, Response: $response");
+                throw new Exception("User info request failed. HTTP Code: $httpCode");
             }
 
-            // Extract user ID and roles
-            $userinfoId = $settings->userinfoId->getValue() ?? 'preferred_username';
+            $userInfo = json_decode($response, true);
+            $userinfoId = $settings->userinfoId->getValue();
             $username = $userInfo[$userinfoId] ?? null;
-            if (!$username) {
-                throw new Exception("Missing username in user info.");
+
+            if (empty($username)) {
+                error_log("LoginOIDC: Missing username in user info response. Response: " . json_encode($userInfo));
+                throw new Exception("Missing username in user info response.");
             }
 
-            error_log("LoginOIDC: Retrieved username: $username");
-
+            // Extract roles from Keycloak claims
+            error_log("LoginOIDC: Extracting roles...");
             $roles = $userInfo['dot-jenkins-bot-authorisation'] ?? [];
-            error_log("LoginOIDC: Roles received from Keycloak: " . json_encode($roles));
+            $role = $this->mapRolesToMatomoRole($roles);
 
-            $mappedRole = $this->mapRoles($roles);
-            if (!$mappedRole) {
-                throw new Exception("No valid role mapping found for user.");
-            }
+            error_log("LoginOIDC: Username: $username, Keycloak Roles: " . json_encode($roles));
+            error_log("LoginOIDC: Mapped Matomo Role: $role");
 
-            error_log("LoginOIDC: Mapping role for user $username: Matomo Role - $mappedRole");
-            $this->addRoleWithPermissions($username, $mappedRole);
+            // Assign the role in the Matomo access table
+            $this->addRoleWithPermissions($username, $role);
 
+            // Check if the user exists in Matomo
             $user = $this->getUserByRemoteId("oidc", $username);
+
             if (empty($user)) {
                 if (Piwik::isUserIsAnonymous()) {
                     $email = $userInfo['email'] ?? $username . "@example.com";
-                    $this->signupUser($settings, $username, $email, $mappedRole);
+                    $this->signupUser($settings, $username, $email, $role);
                 } else {
-                    $this->linkAccount($username, null, $mappedRole);
+                    $this->linkAccount($username, null, $role);
                     $this->redirectToIndex("UsersManager", "userSecurity");
                 }
             } else {
@@ -237,157 +269,7 @@ class Controller extends \Piwik\Plugin\Controller
                 }
             }
         } catch (Exception $e) {
-            error_log("LoginOIDC: Callback failed - " . $e->getMessage());
-            throw $e;
-        }
-    }
-
-
-    /**
-     * Map roles from Keycloak claims to Matomo roles.
-     */
-    private function mapRoles(array $roles): ?string
-    {
-        $roleMapping = [
-            'administrator' => 'admin',
-            'editor' => 'write',
-            'viewer' => 'view',
-        ];
-    
-        foreach ($roles as $role) {
-            $normalizedRole = strtolower($role);
-            if (isset($roleMapping[$normalizedRole])) {
-                return $roleMapping[$normalizedRole];
-            }
-        }
-    
-        return null; // Return null if no valid role mapping is found
-    }
-    
-
-    /**
-     * Make an HTTP GET request.
-     */
-    private function makeHttpGetRequest(string $url, array $headers): string
-    {
-        $curl = curl_init();
-        curl_setopt($curl, CURLOPT_HTTPHEADER, $headers);
-        curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($curl, CURLOPT_URL, $url);
-        $response = curl_exec($curl);
-        $httpCode = curl_getinfo($curl, CURLINFO_HTTP_CODE);
-        curl_close($curl);
-
-        if ($httpCode !== 200) {
-            throw new Exception("HTTP GET request failed. URL: $url, HTTP Code: $httpCode, Response: $response");
-        }
-
-        return $response;
-    }
-
-    /**
-     * Make an HTTP GET request.
-     *
-     * @param string $url
-     * @param array $headers
-     * @return string
-     */
-    private function makeHttpGetRequest(string $url, array $headers): string
-    {
-        $curl = curl_init();
-        curl_setopt($curl, CURLOPT_HTTPHEADER, $headers);
-        curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($curl, CURLOPT_URL, $url);
-        $response = curl_exec($curl);
-        $httpCode = curl_getinfo($curl, CURLINFO_HTTP_CODE);
-        curl_close($curl);
-
-        if ($httpCode !== 200) {
-            throw new Exception("HTTP GET request failed. URL: $url, HTTP Code: $httpCode, Response: $response");
-        }
-
-        return $response;
-    }
-
-
-    /**
-     * Make an HTTP POST request.
-     */
-    private function makeHttpPostRequest(string $url, array $data): string
-    {
-        $curl = curl_init();
-        curl_setopt($curl, CURLOPT_POST, 1);
-        curl_setopt($curl, CURLOPT_POSTFIELDS, http_build_query($data));
-        curl_setopt($curl, CURLOPT_HTTPHEADER, [
-            "Content-Type: application/x-www-form-urlencoded",
-            "Accept: application/json",
-        ]);
-        curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($curl, CURLOPT_URL, $url);
-        $response = curl_exec($curl);
-        $httpCode = curl_getinfo($curl, CURLINFO_HTTP_CODE);
-        curl_close($curl);
-
-        if ($httpCode !== 200) {
-            throw new Exception("HTTP POST request failed. URL: $url, HTTP Code: $httpCode, Response: $response");
-        }
-
-        return $response;
-    }
-
-        /**
-     * Redirect to the Keycloak authorize URL.
-     *
-     * @return void
-     */
-    public function signin()
-    {
-        error_log("LoginOIDC: Starting signin process...");
-
-        try {
-            $settings = new \Piwik\Plugins\LoginOIDC\SystemSettings();
-
-            // Validate request method
-            $allowedMethods = ["POST"];
-            if (!$settings->disableDirectLoginUrl->getValue()) {
-                $allowedMethods[] = "GET";
-            }
-
-            if (!in_array($_SERVER["REQUEST_METHOD"], $allowedMethods)) {
-                throw new Exception(Piwik::translate("LoginOIDC_MethodNotAllowed"));
-            }
-
-            if ($_SERVER["REQUEST_METHOD"] === "POST") {
-                // CSRF protection for POST
-                Nonce::checkNonce(self::OIDC_NONCE, $_POST["form_nonce"]);
-            }
-
-            if (!$this->isPluginSetup($settings)) {
-                throw new Exception("LoginOIDC plugin is not properly configured.");
-            }
-
-            // Generate a random state value for CSRF protection
-            $_SESSION["loginoidc_state"] = $this->generateKey(32);
-
-            // Prepare parameters for the Keycloak authorize URL
-            $params = [
-                "client_id" => $settings->clientId->getValue(),
-                "scope" => $settings->scope->getValue(),
-                "redirect_uri" => $this->getRedirectUri(),
-                "state" => $_SESSION["loginoidc_state"],
-                "response_type" => "code",
-            ];
-
-            // Build the authorize URL
-            $authorizeUrl = $settings->authorizeUrl->getValue();
-            $authorizeUrl .= (strpos($authorizeUrl, '?') === false ? '?' : '&') . http_build_query($params);
-
-            error_log("LoginOIDC: Redirecting to Keycloak authorization URL: $authorizeUrl");
-
-            // Redirect the user to the Keycloak authorize URL
-            Url::redirectToUrl($authorizeUrl);
-        } catch (Exception $e) {
-            error_log("LoginOIDC: Error during signin - " . $e->getMessage());
+            error_log("LoginOIDC: Error during callback - " . $e->getMessage());
             throw $e;
         }
     }
