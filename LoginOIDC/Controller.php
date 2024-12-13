@@ -141,6 +141,12 @@ class Controller extends \Piwik\Plugin\Controller
         Db::query($sql, $bind);
         $this->redirectToIndex("UsersManager", "userSecurity");
     }
+
+    /**
+     * Redirect to the authorize url of the remote oauth service.
+     *
+     * @return void
+     */
     public function signin()
     {
         $settings = new \Piwik\Plugins\LoginOIDC\SystemSettings();
@@ -175,7 +181,6 @@ class Controller extends \Piwik\Plugin\Controller
         Url::redirectToUrl($url);
     }
 
-
     /**
      * Handle callback from oauth service. 
      * Verify callback code, exchange for authorization token and fetch userinfo.
@@ -184,169 +189,130 @@ class Controller extends \Piwik\Plugin\Controller
      */
     public function callback()
     {
-        error_log("LoginOIDC: Starting callback process...");
-
-        try {
-            $settings = new \Piwik\Plugins\LoginOIDC\SystemSettings();
-            if (!$this->isPluginSetup($settings)) {
-                throw new Exception("LoginOIDC plugin is not properly configured.");
-            }
-
-            // Validate state parameter
-            $receivedState = Request::fromGet()->getStringParameter("state");
-            if ($_SESSION["loginoidc_state"] !== $receivedState) {
-                throw new Exception("State mismatch. Expected: {$_SESSION[\"loginoidc_state\"]}, Received: $receivedState");
-            }
+        $settings = new \Piwik\Plugins\LoginOIDC\SystemSettings();
+        if (!$this->isPluginSetup($settings)) {
+            throw new Exception(Piwik::translate("LoginOIDC_ExceptionNotConfigured"));
+        }
+    
+        if ($_SESSION["loginoidc_state"] !== Request::fromGet()->getStringParameter("state")) {
+            throw new Exception(Piwik::translate("LoginOIDC_ExceptionStateMismatch"));
+        } else {
             unset($_SESSION["loginoidc_state"]);
-
-            // Validate provider
-            $provider = Request::fromGet()->getStringParameter("provider");
-            if ($provider !== "oidc") {
-                throw new Exception("Unknown provider received: $provider");
-            }
-
-            // Token exchange
-            error_log("LoginOIDC: Exchanging token...");
-            $data = [
-                "client_id" => $settings->clientId->getValue(),
-                "client_secret" => $settings->clientSecret->getValue(),
-                "code" => Request::fromGet()->getStringParameter("code"),
-                "redirect_uri" => $this->getRedirectUri(),
-                "grant_type" => "authorization_code",
-            ];
-            $dataString = http_build_query($data);
-
-            $curl = curl_init();
-            curl_setopt($curl, CURLOPT_POST, 1);
-            curl_setopt($curl, CURLOPT_POSTFIELDS, $dataString);
-            curl_setopt($curl, CURLOPT_HTTPHEADER, [
-                "Content-Type: application/x-www-form-urlencoded",
-                "Accept: application/json",
-            ]);
-            curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
-            curl_setopt($curl, CURLOPT_URL, $settings->tokenUrl->getValue());
-            $response = curl_exec($curl);
-            $httpCode = curl_getinfo($curl, CURLINFO_HTTP_CODE);
-            curl_close($curl);
-
-            if ($httpCode !== 200) {
-                error_log("LoginOIDC: Token exchange failed. HTTP Code: $httpCode, Response: $response");
-                throw new Exception("Token exchange failed. HTTP Code: $httpCode");
-            }
-
-            $result = json_decode($response, true);
-            if (empty($result['access_token'])) {
-                throw new Exception("Access token is missing in the token exchange response.");
-            }
-
-            $_SESSION['loginoidc_idtoken'] = $result['id_token'] ?? null;
-            $_SESSION['loginoidc_auth'] = true;
-
-            // Fetch user info
-            error_log("LoginOIDC: Fetching user info...");
-            $curl = curl_init();
-            curl_setopt($curl, CURLOPT_HTTPHEADER, [
-                "Authorization: Bearer " . $result['access_token'],
-                "Accept: application/json",
-            ]);
-            curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
-            curl_setopt($curl, CURLOPT_URL, $settings->userinfoUrl->getValue());
-            $response = curl_exec($curl);
-            $httpCode = curl_getinfo($curl, CURLINFO_HTTP_CODE);
-            curl_close($curl);
-
-            if ($httpCode !== 200) {
-                error_log("LoginOIDC: User info request failed. HTTP Code: $httpCode, Response: $response");
-                throw new Exception("User info request failed. HTTP Code: $httpCode");
-            }
-
-            $userInfo = json_decode($response, true);
-            error_log("LoginOIDC: User info response: " . json_encode($userInfo));
-
-            $userinfoId = $settings->userinfoId->getValue() ?? 'preferred_username';
-            $username = $userInfo[$userinfoId] ?? null;
-
-            if (empty($username)) {
-                error_log("LoginOIDC: Missing username in user info response. Response: " . json_encode($userInfo));
-                throw new Exception("Missing username in user info response.");
-            }
-
-            // Extract roles from Keycloak claims
-            error_log("LoginOIDC: Extracting roles...");
-            $roles = $userInfo['roles'] ?? $userInfo['groups'] ?? [];
-            if (empty($roles)) {
-                error_log("LoginOIDC: No roles found in Keycloak claims. Response: " . json_encode($userInfo));
-                throw new Exception("No roles found in Keycloak claims.");
-            }
-
-            $role = $this->mapRoles($roles);
-            if (!$role) {
-                error_log("LoginOIDC: No valid role mapping found for roles: " . json_encode($roles));
-                throw new Exception("No valid role mapping found for user.");
-            }
-
-            error_log("LoginOIDC: Username: $username, Mapped Role: $role");
-
-            // Assign role to user
-            $this->addRoleWithPermissions($username, $role);
-
-            // Handle user login or signup
-            $user = $this->getUserByRemoteId("oidc", $username);
-
-            if (empty($user)) {
-                if (Piwik::isUserIsAnonymous()) {
-                    $email = $userInfo['email'] ?? $username . "@example.com";
-                    $this->signupUser($settings, $username, $email, $role);
-                } else {
-                    $this->linkAccount($username, null, $role);
-                    $this->redirectToIndex("UsersManager", "userSecurity");
-                }
+        }
+    
+        if (Request::fromGet()->getStringParameter("provider") !== "oidc") {
+            throw new Exception(Piwik::translate("LoginOIDC_ExceptionUnknownProvider"));
+        }
+    
+        // Payload for token request
+        $data = [
+            "client_id" => $settings->clientId->getValue(),
+            "client_secret" => $settings->clientSecret->getValue(),
+            "code" => Request::fromGet()->getStringParameter("code"),
+            "redirect_uri" => $this->getRedirectUri(),
+            "grant_type" => "authorization_code",
+            "state" => Request::fromGet()->getStringParameter("state"),
+        ];
+        $dataString = http_build_query($data);
+    
+        $curl = curl_init();
+        curl_setopt($curl, CURLOPT_POST, 1);
+        curl_setopt($curl, CURLOPT_POSTFIELDS, $dataString);
+        curl_setopt($curl, CURLOPT_HTTPHEADER, [
+            "Content-Type: application/x-www-form-urlencoded",
+            "Content-Length: " . strlen($dataString),
+            "Accept: application/json",
+            "User-Agent: LoginOIDC-Matomo-Plugin",
+        ]);
+        curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($curl, CURLOPT_URL, $settings->tokenUrl->getValue());
+        $response = curl_exec($curl);
+        curl_close($curl);
+        $result = json_decode($response);
+    
+        if (empty($result) || empty($result->access_token)) {
+            throw new Exception(Piwik::translate("LoginOIDC_ExceptionInvalidResponse"));
+        }
+    
+        $_SESSION['loginoidc_idtoken'] = empty($result->id_token) ? null : $result->id_token;
+        $_SESSION['loginoidc_auth'] = true;
+    
+        $curl = curl_init();
+        curl_setopt($curl, CURLOPT_HTTPHEADER, [
+            "Authorization: Bearer " . $result->access_token,
+            "Accept: application/json",
+            "User-Agent: LoginOIDC-Matomo-Plugin",
+        ]);
+        curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($curl, CURLOPT_URL, $settings->userinfoUrl->getValue());
+        $response = curl_exec($curl);
+        curl_close($curl);
+        $result = json_decode($response);
+    
+        $userinfoId = $settings->userinfoId->getValue();
+        $providerUserId = $result->$userinfoId;
+    
+        if (empty($providerUserId)) {
+            throw new Exception(Piwik::translate("LoginOIDC_ExceptionInvalidResponse"));
+        }
+    
+        // Group-based Role Mapping
+        $groups = isset($result->groups) ? $result->groups : []; // Expecting 'groups' from Keycloak claims
+        $role = $this->mapGroupsToRole($groups);
+    
+        // Log extracted and mapped roles for debugging
+        error_log("User: {$result->email}, Groups: " . json_encode($groups));
+        error_log("Mapped Role: {$role}");
+    
+        $user = $this->getUserByRemoteId("oidc", $providerUserId);
+    
+        if (empty($user)) {
+            if (Piwik::isUserIsAnonymous()) {
+                // New user - sign them up and assign the role
+                $this->signupUser($settings, $providerUserId, $result->email, $role);
             } else {
-                if (Piwik::isUserIsAnonymous()) {
-                    $this->signinAndRedirect($user, $settings);
+                // Link the current user with the remote user and assign the role
+                $this->linkAccount($providerUserId, null, $role);
+                $this->redirectToIndex("UsersManager", "userSecurity");
+            }
+        } else {
+            if (Piwik::isUserIsAnonymous()) {
+                $this->signinAndRedirect($user, $settings);
+            } else {
+                if (Piwik::getCurrentUserLogin() === $user["login"]) {
+                    $this->passwordVerify->setPasswordVerifiedCorrectly();
+                    return;
                 } else {
-                    if (Piwik::getCurrentUserLogin() === $user["login"]) {
-                        $this->passwordVerify->setPasswordVerifiedCorrectly();
-                        return;
-                    } else {
-                        throw new Exception("User is already linked to a different account.");
-                    }
+                    throw new Exception(Piwik::translate("LoginOIDC_ExceptionAlreadyLinkedToDifferentAccount"));
                 }
             }
-        } catch (Exception $e) {
-            error_log("LoginOIDC: Callback failed - " . $e->getMessage());
-            throw $e;
         }
     }
 
     /**
-     * Fetch user role from external JSON source.
-     *
-     * @param string $username
-     * @return string
-     */
-    private function getRoleFromExternalSource(string $username): string
+ * Map OIDC groups to roles.
+ *
+ * @param array $groups
+ * @return string
+ */
+    private function mapGroupsToRole(array $groups): string
     {
-        $jsonString = file_get_contents('/path/to/external/roles.json'); // Path to your JSON file
-        $data = json_decode($jsonString, true);
+        // Define your group-to-role mapping
+        $groupRoleMap = [
+            'reader-all' => 'reader',
+            'contributor-all' => 'editor',
+            'administrator-all' => 'administrator',
+        ];
 
-        if (!isset($data['users'])) {
-            error_log("No users found in JSON");
-            return 'reader'; // Default to 'reader' role
-        }
-
-        foreach ($data['users'] as $user) {
-            if (strtolower($user['username']) === strtolower($username)) {
-                return strtolower($user['role']); // Return role from JSON
+        foreach ($groups as $group) {
+            if (isset($groupRoleMap[$group])) {
+                return $groupRoleMap[$group];
             }
         }
 
-        error_log("No role found for user {$username}. Defaulting to 'reader'.");
-        return 'reader'; // Default role if user not found
+        // Default to 'reader' if no matching group is found
+        return 'reader';
     }
-
-
-
     /**
      * Check whether the given user has superuser access.
      * The function in Piwik\Core cannot be used because it requires an admin user being signed in.
@@ -461,7 +427,6 @@ class Controller extends \Piwik\Plugin\Controller
             throw $e;
         }
     }
-    
     
 
     /**
