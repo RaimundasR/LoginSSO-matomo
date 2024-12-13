@@ -337,6 +337,7 @@ class Controller extends \Piwik\Plugin\Controller
     }
 
 
+
     /**
      * Fetch user role from external JSON source.
      *
