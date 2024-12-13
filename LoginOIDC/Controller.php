@@ -165,6 +165,11 @@ class Controller extends \Piwik\Plugin\Controller
             }
             unset($_SESSION["loginoidc_state"]);
 
+            $provider = Request::fromGet()->getStringParameter("provider");
+            if ($provider !== "oidc") {
+                throw new Exception("Unknown provider received: $provider");
+            }
+
             // Token exchange
             $data = [
                 "client_id" => $settings->clientId->getValue(),
@@ -198,6 +203,9 @@ class Controller extends \Piwik\Plugin\Controller
                 throw new Exception("Access token is missing in the token exchange response.");
             }
 
+            $_SESSION['loginoidc_idtoken'] = $result['id_token'] ?? null;
+            $_SESSION['loginoidc_auth'] = true;
+
             // Fetch user info
             $curl = curl_init();
             curl_setopt($curl, CURLOPT_HTTPHEADER, [
@@ -220,7 +228,9 @@ class Controller extends \Piwik\Plugin\Controller
             }
 
             // Process user information
-            $username = $userInfo[$settings->userinfoId->getValue() ?? 'preferred_username'] ?? null;
+            $userinfoId = $settings->userinfoId->getValue() ?? 'preferred_username'; // Default to 'preferred_username'
+            $username = $userInfo[$userinfoId] ?? null;
+
             if (!$username) {
                 throw new Exception("Missing username in user info.");
             }
@@ -231,29 +241,66 @@ class Controller extends \Piwik\Plugin\Controller
             $roles = $userInfo['dot-jenkins-bot-authorisation'] ?? [];
             if (empty($roles)) {
                 error_log("LoginOIDC: No roles found in Keycloak claims.");
+            } else {
+                error_log("LoginOIDC: Roles found in Keycloak claims: " . json_encode($roles));
             }
 
-            // Assign roles
-            $role = 'reader';
-            foreach ($roles as $claimRole) {
-                if (strtolower($claimRole) === 'administrator') {
-                    $role = 'administrator';
+            // Check if external JSON roles are included in the token
+            $externalRolesJson = $userInfo['dot-jenkins-bot-authorisation-json'] ?? null;
+            if (!$externalRolesJson) {
+                error_log("LoginOIDC: No external roles JSON found in Keycloak claims.");
+            }
+
+            $externalRoles = json_decode($externalRolesJson, true);
+            if (!$externalRoles || empty($externalRoles['users'])) {
+                error_log("LoginOIDC: No users found in external roles JSON.");
+            }
+
+            // Assign roles based on Keycloak and external JSON
+            $role = 'reader'; // Default role
+            foreach ($externalRoles['users'] as $user) {
+                if (strtolower($user['username']) === strtolower($username)) {
+                    $role = strtolower($user['role']); // Map role to Matomo role
                     break;
                 }
             }
-            error_log("LoginOIDC: Mapping role for user $username: OIDC Role - $role");
 
-            // Assign role to user
+            // Log the mapped role
+            error_log("LoginOIDC: Mapping role for user $username: OIDC Role - $role");
             $this->addRoleWithPermissions($username, $role);
 
-            // Proceed with Matomo-specific logic
-            // ...
+            // Check if the user exists in Matomo
+            $user = $this->getUserByRemoteId("oidc", $username);
 
+            if (empty($user)) {
+                if (Piwik::isUserIsAnonymous()) {
+                    // New user signup
+                    $email = $userInfo['email'] ?? $username . "@example.com";
+                    $this->signupUser($settings, $username, $email, $role);
+                } else {
+                    // Link account for signed-in user
+                    $this->linkAccount($username, null, $role);
+                    $this->redirectToIndex("UsersManager", "userSecurity");
+                }
+            } else {
+                if (Piwik::isUserIsAnonymous()) {
+                    // Sign in existing user
+                    $this->signinAndRedirect($user, $settings);
+                } else {
+                    if (Piwik::getCurrentUserLogin() === $user["login"]) {
+                        $this->passwordVerify->setPasswordVerifiedCorrectly();
+                        return;
+                    } else {
+                        throw new Exception("User is already linked to a different account.");
+                    }
+                }
+            }
         } catch (Exception $e) {
             error_log("LoginOIDC: Callback failed - " . $e->getMessage());
             throw $e;
         }
     }
+
 
 
 
