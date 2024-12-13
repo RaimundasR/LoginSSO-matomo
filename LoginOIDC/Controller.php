@@ -189,22 +189,28 @@ class Controller extends \Piwik\Plugin\Controller
      */
     public function callback()
     {
+        error_log("LoginOIDC: Starting callback process...");
+
         $settings = new \Piwik\Plugins\LoginOIDC\SystemSettings();
         if (!$this->isPluginSetup($settings)) {
+            error_log("LoginOIDC: Plugin is not configured properly.");
             throw new Exception(Piwik::translate("LoginOIDC_ExceptionNotConfigured"));
         }
 
+        // Validate state parameter
         if ($_SESSION["loginoidc_state"] !== Request::fromGet()->getStringParameter("state")) {
+            error_log("LoginOIDC: State mismatch error during OIDC callback.");
             throw new Exception(Piwik::translate("LoginOIDC_ExceptionStateMismatch"));
-        } else {
-            unset($_SESSION["loginoidc_state"]);
         }
+        unset($_SESSION["loginoidc_state"]);
 
-        if (Request::fromGet()->getStringParameter("provider") !== "oidc") {
+        $provider = Request::fromGet()->getStringParameter("provider");
+        if ($provider !== "oidc") {
+            error_log("LoginOIDC: Unknown provider received: $provider");
             throw new Exception(Piwik::translate("LoginOIDC_ExceptionUnknownProvider"));
         }
 
-        // Token exchange
+        // Exchange authorization code for tokens
         $data = [
             "client_id" => $settings->clientId->getValue(),
             "client_secret" => $settings->clientSecret->getValue(),
@@ -220,7 +226,6 @@ class Controller extends \Piwik\Plugin\Controller
         curl_setopt($curl, CURLOPT_POSTFIELDS, $dataString);
         curl_setopt($curl, CURLOPT_HTTPHEADER, [
             "Content-Type: application/x-www-form-urlencoded",
-            "Content-Length: " . strlen($dataString),
             "Accept: application/json",
             "User-Agent: LoginOIDC-Matomo-Plugin",
         ]);
@@ -231,12 +236,14 @@ class Controller extends \Piwik\Plugin\Controller
         $result = json_decode($response);
 
         if (empty($result) || empty($result->access_token)) {
+            error_log("LoginOIDC: Failed to retrieve access token.");
             throw new Exception(Piwik::translate("LoginOIDC_ExceptionInvalidResponse"));
         }
 
         $_SESSION['loginoidc_idtoken'] = empty($result->id_token) ? null : $result->id_token;
         $_SESSION['loginoidc_auth'] = true;
 
+        // Fetch user info using the access token
         $curl = curl_init();
         curl_setopt($curl, CURLOPT_HTTPHEADER, [
             "Authorization: Bearer " . $result->access_token,
@@ -249,46 +256,65 @@ class Controller extends \Piwik\Plugin\Controller
         curl_close($curl);
         $result = json_decode($response);
 
+        // Get the username or user ID from Keycloak
         $userinfoId = $settings->userinfoId->getValue();
-        $username = $result->$userinfoId; // Use 'username' from Keycloak claims
+        $username = $result->$userinfoId;
 
         if (empty($username)) {
+            error_log("LoginOIDC: Missing user identifier in Keycloak response.");
             throw new Exception(Piwik::translate("LoginOIDC_ExceptionInvalidResponse"));
         }
 
-        // Extract roles from the Keycloak scope
+        // Extract roles from Keycloak claims
         $roles = isset($result->dot_jenkins_bot_authorisation) ? $result->dot_jenkins_bot_authorisation : [];
         $role = $this->mapRolesToMatomoRole($roles);
 
-        // Log extracted roles and mapping
-        error_log("User: {$username}, Keycloak Roles: " . json_encode($roles));
-        error_log("Mapped Matomo Role: {$role}");
+        // Log roles for debugging
+        error_log("LoginOIDC: Username: $username");
+        error_log("LoginOIDC: Keycloak roles: " . json_encode($roles));
+        error_log("LoginOIDC: Mapped Matomo role: $role");
 
-        // Assign the role in the Matomo access table
-        $this->addRoleWithPermissions($username, $role);
+        // Add or update role in Matomo
+        try {
+            $this->addRoleWithPermissions($username, $role);
+        } catch (Exception $e) {
+            error_log("LoginOIDC: Failed to update Matomo role for user $username. Error: " . $e->getMessage());
+            throw $e;
+        }
 
+        // Check if the user exists in Matomo
         $user = $this->getUserByRemoteId("oidc", $username);
 
         if (empty($user)) {
             if (Piwik::isUserIsAnonymous()) {
-                $this->signupUser($settings, $username, $username . "@example.com", $role); // Use default email domain
+                // New user signup
+                $email = isset($result->email) ? $result->email : $username . "@example.com";
+                error_log("LoginOIDC: Signing up new user $username with role $role.");
+                $this->signupUser($settings, $username, $email, $role);
             } else {
+                // Link account for signed-in user
+                error_log("LoginOIDC: Linking existing account to user $username.");
                 $this->linkAccount($username, null, $role);
                 $this->redirectToIndex("UsersManager", "userSecurity");
             }
         } else {
             if (Piwik::isUserIsAnonymous()) {
+                // Sign in existing user
+                error_log("LoginOIDC: Signing in existing user $username.");
                 $this->signinAndRedirect($user, $settings);
             } else {
                 if (Piwik::getCurrentUserLogin() === $user["login"]) {
+                    error_log("LoginOIDC: User $username is already signed in.");
                     $this->passwordVerify->setPasswordVerifiedCorrectly();
                     return;
                 } else {
+                    error_log("LoginOIDC: User $username is linked to a different account.");
                     throw new Exception(Piwik::translate("LoginOIDC_ExceptionAlreadyLinkedToDifferentAccount"));
                 }
             }
         }
     }
+
 
     /**
      * Fetch user role from external JSON source.
