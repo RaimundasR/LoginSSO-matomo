@@ -141,6 +141,40 @@ class Controller extends \Piwik\Plugin\Controller
         Db::query($sql, $bind);
         $this->redirectToIndex("UsersManager", "userSecurity");
     }
+    public function signin()
+    {
+        $settings = new \Piwik\Plugins\LoginOIDC\SystemSettings();
+
+        $allowedMethods = array("POST");
+        if (!$settings->disableDirectLoginUrl->getValue()) {
+            array_push($allowedMethods, "GET");
+        }
+        if (!in_array($_SERVER["REQUEST_METHOD"], $allowedMethods)) {
+            throw new Exception(Piwik::translate("LoginOIDC_MethodNotAllowed"));
+        }
+
+        if ($_SERVER["REQUEST_METHOD"] === "POST") {
+            // csrf protection
+            Nonce::checkNonce(self::OIDC_NONCE, $_POST["form_nonce"]);
+        }
+
+        if (!$this->isPluginSetup($settings)) {
+            throw new Exception(Piwik::translate("LoginOIDC_ExceptionNotConfigured"));
+        }
+
+        $_SESSION["loginoidc_state"] = $this->generateKey(32);
+        $params = array(
+            "client_id" => $settings->clientId->getValue(),
+            "scope" => $settings->scope->getValue(),
+            "redirect_uri"=> $this->getRedirectUri(),
+            "state" => $_SESSION["loginoidc_state"],
+            "response_type" => "code"
+        );
+        $url = $settings->authorizeUrl->getValue();
+        $url .= (parse_url($url, PHP_URL_QUERY) ? "&" : "?") . http_build_query($params);
+        Url::redirectToUrl($url);
+    }
+
 
     /**
      * Redirect to the authorize url of the remote oauth service.
