@@ -271,32 +271,30 @@ class Controller extends \Piwik\Plugin\Controller
                 throw new Exception("Missing user identifier in the user info response.");
             }
 
-            // Extract roles and external JSON from Keycloak claims
+            // Extract roles from Keycloak claims
             $roles = $userInfo['dot-jenkins-bot-authorisation'] ?? [];
-            $externalRolesJson = $userInfo['external-roles-json'] ?? null;
-
             if (empty($roles)) {
                 error_log("LoginOIDC: No roles found in Keycloak claims.");
             }
 
-            if (empty($externalRolesJson)) {
+            // Check if JSON roles are included in the token
+            $externalRolesJson = $userInfo['dot-jenkins-bot-authorisation-json'] ?? null;
+            if (!$externalRolesJson) {
                 error_log("LoginOIDC: No external roles JSON found in Keycloak claims.");
             }
 
-            // Decode external roles JSON
-            $externalRolesData = json_decode($externalRolesJson, true);
-            if (empty($externalRolesData['users'])) {
+            $externalRoles = json_decode($externalRolesJson, true);
+            if (!$externalRoles || empty($externalRoles['users'])) {
                 error_log("LoginOIDC: No users found in external roles JSON.");
             }
 
-            // Map roles and assign to user
-            foreach ($roles as $keycloakRole) {
-                foreach ($externalRolesData['users'] as $user) {
-                    if (strtolower($user['username']) === strtolower($username) && strtolower($user['role']) === strtolower($keycloakRole)) {
-                        $role = $this->mapRolesToMatomoRole([$user['role']]);
-                        error_log("LoginOIDC: Assigning role $role to user $username.");
-                        $this->addRoleWithPermissions($username, $role);
-                    }
+            // Assign roles based on Keycloak and external JSON
+            foreach ($externalRoles['users'] as $user) {
+                if (strtolower($user['username']) === strtolower($username)) {
+                    $role = strtolower($user['role']); // Map role to Matomo role
+                    $this->addRoleWithPermissions($username, $role);
+                    error_log("LoginOIDC: Assigned role '$role' to user '$username'.");
+                    break;
                 }
             }
 
@@ -305,14 +303,17 @@ class Controller extends \Piwik\Plugin\Controller
 
             if (empty($user)) {
                 if (Piwik::isUserIsAnonymous()) {
+                    // New user signup
                     $email = $userInfo['email'] ?? $username . "@example.com";
-                    $this->signupUser($settings, $username, $email, $role);
+                    $this->signupUser($settings, $username, $email, $role ?? 'reader');
                 } else {
-                    $this->linkAccount($username, null, $role);
+                    // Link account for signed-in user
+                    $this->linkAccount($username, null, $role ?? 'reader');
                     $this->redirectToIndex("UsersManager", "userSecurity");
                 }
             } else {
                 if (Piwik::isUserIsAnonymous()) {
+                    // Sign in existing user
                     $this->signinAndRedirect($user, $settings);
                 } else {
                     if (Piwik::getCurrentUserLogin() === $user["login"]) {
