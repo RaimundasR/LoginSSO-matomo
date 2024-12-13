@@ -301,6 +301,62 @@ class Controller extends \Piwik\Plugin\Controller
         }
     }
 
+        /**
+     * Redirect to the Keycloak authorize URL.
+     *
+     * @return void
+     */
+    public function signin()
+    {
+        error_log("LoginOIDC: Starting signin process...");
+
+        try {
+            $settings = new \Piwik\Plugins\LoginOIDC\SystemSettings();
+
+            // Validate request method
+            $allowedMethods = ["POST"];
+            if (!$settings->disableDirectLoginUrl->getValue()) {
+                $allowedMethods[] = "GET";
+            }
+
+            if (!in_array($_SERVER["REQUEST_METHOD"], $allowedMethods)) {
+                throw new Exception(Piwik::translate("LoginOIDC_MethodNotAllowed"));
+            }
+
+            if ($_SERVER["REQUEST_METHOD"] === "POST") {
+                // CSRF protection for POST
+                Nonce::checkNonce(self::OIDC_NONCE, $_POST["form_nonce"]);
+            }
+
+            if (!$this->isPluginSetup($settings)) {
+                throw new Exception("LoginOIDC plugin is not properly configured.");
+            }
+
+            // Generate a random state value for CSRF protection
+            $_SESSION["loginoidc_state"] = $this->generateKey(32);
+
+            // Prepare parameters for the Keycloak authorize URL
+            $params = [
+                "client_id" => $settings->clientId->getValue(),
+                "scope" => $settings->scope->getValue(),
+                "redirect_uri" => $this->getRedirectUri(),
+                "state" => $_SESSION["loginoidc_state"],
+                "response_type" => "code",
+            ];
+
+            // Build the authorize URL
+            $authorizeUrl = $settings->authorizeUrl->getValue();
+            $authorizeUrl .= (strpos($authorizeUrl, '?') === false ? '?' : '&') . http_build_query($params);
+
+            error_log("LoginOIDC: Redirecting to Keycloak authorization URL: $authorizeUrl");
+
+            // Redirect the user to the Keycloak authorize URL
+            Url::redirectToUrl($authorizeUrl);
+        } catch (Exception $e) {
+            error_log("LoginOIDC: Error during signin - " . $e->getMessage());
+            throw $e;
+        }
+    }
 
 
 
