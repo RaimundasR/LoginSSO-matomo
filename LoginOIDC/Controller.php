@@ -165,6 +165,7 @@ class Controller extends \Piwik\Plugin\Controller
             }
             unset($_SESSION["loginoidc_state"]);
 
+            // Validate provider
             $provider = Request::fromGet()->getStringParameter("provider");
             if ($provider !== "oidc") {
                 throw new Exception("Unknown provider received: $provider");
@@ -203,9 +204,6 @@ class Controller extends \Piwik\Plugin\Controller
                 throw new Exception("Access token is missing in the token exchange response.");
             }
 
-            $_SESSION['loginoidc_idtoken'] = $result['id_token'] ?? null;
-            $_SESSION['loginoidc_auth'] = true;
-
             // Fetch user info
             $curl = curl_init();
             curl_setopt($curl, CURLOPT_HTTPHEADER, [
@@ -227,10 +225,9 @@ class Controller extends \Piwik\Plugin\Controller
                 throw new Exception("Invalid user info response.");
             }
 
-            // Process user information
+            // Extract user ID and roles
             $userinfoId = $settings->userinfoId->getValue() ?? 'preferred_username'; // Default to 'preferred_username'
             $username = $userInfo[$userinfoId] ?? null;
-
             if (!$username) {
                 throw new Exception("Missing username in user info.");
             }
@@ -239,52 +236,36 @@ class Controller extends \Piwik\Plugin\Controller
 
             // Extract roles from Keycloak claims
             $roles = $userInfo['dot-jenkins-bot-authorisation'] ?? [];
+            error_log("LoginOIDC: Roles received from Keycloak: " . json_encode($roles));
+
             if (empty($roles)) {
-                error_log("LoginOIDC: No roles found in Keycloak claims.");
-            } else {
-                error_log("LoginOIDC: Roles found in Keycloak claims: " . json_encode($roles));
+                throw new Exception("No roles found in Keycloak claims. Cannot assign access.");
             }
 
-            // Check if external JSON roles are included in the token
-            $externalRolesJson = $userInfo['dot-jenkins-bot-authorisation-json'] ?? null;
-            if (!$externalRolesJson) {
-                error_log("LoginOIDC: No external roles JSON found in Keycloak claims.");
-            }
-
-            $externalRoles = json_decode($externalRolesJson, true);
-            if (!$externalRoles || empty($externalRoles['users'])) {
-                error_log("LoginOIDC: No users found in external roles JSON.");
-            }
-
-            // Assign roles based on Keycloak and external JSON
-            $role = 'reader'; // Default role
-            foreach ($externalRoles['users'] as $user) {
-                if (strtolower($user['username']) === strtolower($username)) {
-                    $role = strtolower($user['role']); // Map role to Matomo role
-                    break;
-                }
+            // Map roles to Matomo permissions
+            $mappedRole = $this->mapRoles($roles);
+            if (!$mappedRole) {
+                throw new Exception("No valid role mapping found for user.");
             }
 
             // Log the mapped role
-            error_log("LoginOIDC: Mapping role for user $username: OIDC Role - $role");
-            $this->addRoleWithPermissions($username, $role);
+            error_log("LoginOIDC: Mapping role for user $username: Matomo Role - $mappedRole");
 
-            // Check if the user exists in Matomo
+            // Assign role to user
+            $this->addRoleWithPermissions($username, $mappedRole);
+
+            // Handle user login or signup
             $user = $this->getUserByRemoteId("oidc", $username);
-
             if (empty($user)) {
                 if (Piwik::isUserIsAnonymous()) {
-                    // New user signup
                     $email = $userInfo['email'] ?? $username . "@example.com";
-                    $this->signupUser($settings, $username, $email, $role);
+                    $this->signupUser($settings, $username, $email, $mappedRole);
                 } else {
-                    // Link account for signed-in user
-                    $this->linkAccount($username, null, $role);
+                    $this->linkAccount($username, null, $mappedRole);
                     $this->redirectToIndex("UsersManager", "userSecurity");
                 }
             } else {
                 if (Piwik::isUserIsAnonymous()) {
-                    // Sign in existing user
                     $this->signinAndRedirect($user, $settings);
                 } else {
                     if (Piwik::getCurrentUserLogin() === $user["login"]) {
@@ -299,6 +280,93 @@ class Controller extends \Piwik\Plugin\Controller
             error_log("LoginOIDC: Callback failed - " . $e->getMessage());
             throw $e;
         }
+    }
+
+    /**
+     * Map roles from Keycloak claims to Matomo roles.
+     */
+    private function mapRoles(array $roles): ?string
+    {
+        $roleMapping = [
+            'administrator' => 'admin',
+            'editor' => 'write',
+            'viewer' => 'view',
+        ];
+    
+        foreach ($roles as $role) {
+            $normalizedRole = strtolower($role);
+            if (isset($roleMapping[$normalizedRole])) {
+                return $roleMapping[$normalizedRole];
+            }
+        }
+    
+        return null; // Return null if no valid role mapping is found
+    }
+    
+
+    /**
+     * Make an HTTP GET request.
+     */
+    private function makeHttpGetRequest(string $url, array $headers): string
+    {
+        $curl = curl_init();
+        curl_setopt($curl, CURLOPT_HTTPHEADER, $headers);
+        curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($curl, CURLOPT_URL, $url);
+        $response = curl_exec($curl);
+        $httpCode = curl_getinfo($curl, CURLINFO_HTTP_CODE);
+        curl_close($curl);
+
+        if ($httpCode !== 200) {
+            throw new Exception("HTTP GET request failed. URL: $url, HTTP Code: $httpCode, Response: $response");
+        }
+
+        return $response;
+    }
+
+    /**
+     * Make an HTTP GET request.
+     */
+    private function makeHttpGetRequest(string $url, array $headers): string
+    {
+        $curl = curl_init();
+        curl_setopt($curl, CURLOPT_HTTPHEADER, $headers);
+        curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($curl, CURLOPT_URL, $url);
+        $response = curl_exec($curl);
+        $httpCode = curl_getinfo($curl, CURLINFO_HTTP_CODE);
+        curl_close($curl);
+
+        if ($httpCode !== 200) {
+            throw new Exception("HTTP GET request failed. URL: $url, HTTP Code: $httpCode, Response: $response");
+        }
+
+        return $response;
+    }
+
+    /**
+     * Make an HTTP POST request.
+     */
+    private function makeHttpPostRequest(string $url, array $data): string
+    {
+        $curl = curl_init();
+        curl_setopt($curl, CURLOPT_POST, 1);
+        curl_setopt($curl, CURLOPT_POSTFIELDS, http_build_query($data));
+        curl_setopt($curl, CURLOPT_HTTPHEADER, [
+            "Content-Type: application/x-www-form-urlencoded",
+            "Accept: application/json",
+        ]);
+        curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($curl, CURLOPT_URL, $url);
+        $response = curl_exec($curl);
+        $httpCode = curl_getinfo($curl, CURLINFO_HTTP_CODE);
+        curl_close($curl);
+
+        if ($httpCode !== 200) {
+            throw new Exception("HTTP POST request failed. URL: $url, HTTP Code: $httpCode, Response: $response");
+        }
+
+        return $response;
     }
 
         /**
