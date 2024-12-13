@@ -146,13 +146,12 @@ class Controller extends \Piwik\Plugin\Controller
      * Redirect to the authorize url of the remote oauth service.
      *
      * @return void
-    */
+     */
     public function callback()
     {
         error_log("LoginOIDC: Starting callback process...");
 
         try {
-            // Validate plugin setup
             $settings = new \Piwik\Plugins\LoginOIDC\SystemSettings();
             if (!$this->isPluginSetup($settings)) {
                 throw new Exception("Plugin is not configured properly.");
@@ -165,13 +164,12 @@ class Controller extends \Piwik\Plugin\Controller
             }
             unset($_SESSION["loginoidc_state"]);
 
-            // Validate provider
             $provider = Request::fromGet()->getStringParameter("provider");
             if ($provider !== "oidc") {
                 throw new Exception("Unknown provider received: $provider");
             }
 
-            // Token exchange
+            // Exchange token
             $data = [
                 "client_id" => $settings->clientId->getValue(),
                 "client_secret" => $settings->clientSecret->getValue(),
@@ -179,54 +177,26 @@ class Controller extends \Piwik\Plugin\Controller
                 "redirect_uri" => $this->getRedirectUri(),
                 "grant_type" => "authorization_code",
             ];
-            $dataString = http_build_query($data);
-
-            $curl = curl_init();
-            curl_setopt($curl, CURLOPT_POST, 1);
-            curl_setopt($curl, CURLOPT_POSTFIELDS, $dataString);
-            curl_setopt($curl, CURLOPT_HTTPHEADER, [
-                "Content-Type: application/x-www-form-urlencoded",
-                "Accept: application/json",
-                "User-Agent: LoginOIDC-Matomo-Plugin",
-            ]);
-            curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
-            curl_setopt($curl, CURLOPT_URL, $settings->tokenUrl->getValue());
-            $response = curl_exec($curl);
-            $httpCode = curl_getinfo($curl, CURLINFO_HTTP_CODE);
-            curl_close($curl);
-
-            if ($httpCode !== 200) {
-                throw new Exception("Token exchange failed. HTTP Code: $httpCode, Response: $response");
-            }
-
+            $response = $this->makeHttpPostRequest($settings->tokenUrl->getValue(), $data);
             $result = json_decode($response, true);
+
             if (empty($result['access_token'])) {
                 throw new Exception("Access token is missing in the token exchange response.");
             }
 
             // Fetch user info
-            $curl = curl_init();
-            curl_setopt($curl, CURLOPT_HTTPHEADER, [
-                "Authorization: Bearer " . $result['access_token'],
-                "Accept: application/json",
-            ]);
-            curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
-            curl_setopt($curl, CURLOPT_URL, $settings->userinfoUrl->getValue());
-            $response = curl_exec($curl);
-            $httpCode = curl_getinfo($curl, CURLINFO_HTTP_CODE);
-            curl_close($curl);
+            $userInfoResponse = $this->makeHttpGetRequest(
+                $settings->userinfoUrl->getValue(),
+                ["Authorization: Bearer " . $result['access_token'], "Accept: application/json"]
+            );
+            $userInfo = json_decode($userInfoResponse, true);
 
-            if ($httpCode !== 200) {
-                throw new Exception("User info request failed. HTTP Code: $httpCode, Response: $response");
-            }
-
-            $userInfo = json_decode($response, true);
             if (!$userInfo || !is_array($userInfo)) {
                 throw new Exception("Invalid user info response.");
             }
 
             // Extract user ID and roles
-            $userinfoId = $settings->userinfoId->getValue() ?? 'preferred_username'; // Default to 'preferred_username'
+            $userinfoId = $settings->userinfoId->getValue() ?? 'preferred_username';
             $username = $userInfo[$userinfoId] ?? null;
             if (!$username) {
                 throw new Exception("Missing username in user info.");
@@ -234,27 +204,17 @@ class Controller extends \Piwik\Plugin\Controller
 
             error_log("LoginOIDC: Retrieved username: $username");
 
-            // Extract roles from Keycloak claims
             $roles = $userInfo['dot-jenkins-bot-authorisation'] ?? [];
             error_log("LoginOIDC: Roles received from Keycloak: " . json_encode($roles));
 
-            if (empty($roles)) {
-                throw new Exception("No roles found in Keycloak claims. Cannot assign access.");
-            }
-
-            // Map roles to Matomo permissions
             $mappedRole = $this->mapRoles($roles);
             if (!$mappedRole) {
                 throw new Exception("No valid role mapping found for user.");
             }
 
-            // Log the mapped role
             error_log("LoginOIDC: Mapping role for user $username: Matomo Role - $mappedRole");
-
-            // Assign role to user
             $this->addRoleWithPermissions($username, $mappedRole);
 
-            // Handle user login or signup
             $user = $this->getUserByRemoteId("oidc", $username);
             if (empty($user)) {
                 if (Piwik::isUserIsAnonymous()) {
@@ -281,6 +241,7 @@ class Controller extends \Piwik\Plugin\Controller
             throw $e;
         }
     }
+
 
     /**
      * Map roles from Keycloak claims to Matomo roles.
@@ -326,6 +287,10 @@ class Controller extends \Piwik\Plugin\Controller
 
     /**
      * Make an HTTP GET request.
+     *
+     * @param string $url
+     * @param array $headers
+     * @return string
      */
     private function makeHttpGetRequest(string $url, array $headers): string
     {
@@ -343,6 +308,7 @@ class Controller extends \Piwik\Plugin\Controller
 
         return $response;
     }
+
 
     /**
      * Make an HTTP POST request.
