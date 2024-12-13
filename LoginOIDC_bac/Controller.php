@@ -182,7 +182,7 @@ class Controller extends \Piwik\Plugin\Controller
     }
 
     /**
-     * Handle callback from oauth service.
+     * Handle callback from oauth service. 
      * Verify callback code, exchange for authorization token and fetch userinfo.
      *
      * @return void
@@ -193,18 +193,18 @@ class Controller extends \Piwik\Plugin\Controller
         if (!$this->isPluginSetup($settings)) {
             throw new Exception(Piwik::translate("LoginOIDC_ExceptionNotConfigured"));
         }
-
+    
         if ($_SESSION["loginoidc_state"] !== Request::fromGet()->getStringParameter("state")) {
             throw new Exception(Piwik::translate("LoginOIDC_ExceptionStateMismatch"));
         } else {
             unset($_SESSION["loginoidc_state"]);
         }
-
+    
         if (Request::fromGet()->getStringParameter("provider") !== "oidc") {
             throw new Exception(Piwik::translate("LoginOIDC_ExceptionUnknownProvider"));
         }
-
-        // Token exchange
+    
+        // Payload for token request
         $data = [
             "client_id" => $settings->clientId->getValue(),
             "client_secret" => $settings->clientSecret->getValue(),
@@ -214,7 +214,7 @@ class Controller extends \Piwik\Plugin\Controller
             "state" => Request::fromGet()->getStringParameter("state"),
         ];
         $dataString = http_build_query($data);
-
+    
         $curl = curl_init();
         curl_setopt($curl, CURLOPT_POST, 1);
         curl_setopt($curl, CURLOPT_POSTFIELDS, $dataString);
@@ -229,14 +229,14 @@ class Controller extends \Piwik\Plugin\Controller
         $response = curl_exec($curl);
         curl_close($curl);
         $result = json_decode($response);
-
+    
         if (empty($result) || empty($result->access_token)) {
             throw new Exception(Piwik::translate("LoginOIDC_ExceptionInvalidResponse"));
         }
-
+    
         $_SESSION['loginoidc_idtoken'] = empty($result->id_token) ? null : $result->id_token;
         $_SESSION['loginoidc_auth'] = true;
-
+    
         $curl = curl_init();
         curl_setopt($curl, CURLOPT_HTTPHEADER, [
             "Authorization: Bearer " . $result->access_token,
@@ -248,32 +248,31 @@ class Controller extends \Piwik\Plugin\Controller
         $response = curl_exec($curl);
         curl_close($curl);
         $result = json_decode($response);
-
+    
         $userinfoId = $settings->userinfoId->getValue();
-        $username = $result->$userinfoId; // Use 'username' from Keycloak claims
-
-        if (empty($username)) {
+        $providerUserId = $result->$userinfoId;
+    
+        if (empty($providerUserId)) {
             throw new Exception(Piwik::translate("LoginOIDC_ExceptionInvalidResponse"));
         }
-
-        // Extract roles from the Keycloak scope
-        $roles = isset($result->dot_jenkins_bot_authorisation) ? $result->dot_jenkins_bot_authorisation : [];
-        $role = $this->mapRolesToMatomoRole($roles);
-
-        // Log extracted roles and mapping
-        error_log("User: {$username}, Keycloak Roles: " . json_encode($roles));
-        error_log("Mapped Matomo Role: {$role}");
-
-        // Assign the role in the Matomo access table
-        $this->addRoleWithPermissions($username, $role);
-
-        $user = $this->getUserByRemoteId("oidc", $username);
-
+    
+        // Group-based Role Mapping
+        $groups = isset($result->groups) ? $result->groups : []; // Expecting 'groups' from Keycloak claims
+        $role = $this->mapGroupsToRole($groups);
+    
+        // Log extracted and mapped roles for debugging
+        error_log("User: {$result->email}, Groups: " . json_encode($groups));
+        error_log("Mapped Role: {$role}");
+    
+        $user = $this->getUserByRemoteId("oidc", $providerUserId);
+    
         if (empty($user)) {
             if (Piwik::isUserIsAnonymous()) {
-                $this->signupUser($settings, $username, $username . "@example.com", $role); // Use default email domain
+                // New user - sign them up and assign the role
+                $this->signupUser($settings, $providerUserId, $result->email, $role);
             } else {
-                $this->linkAccount($username, null, $role);
+                // Link the current user with the remote user and assign the role
+                $this->linkAccount($providerUserId, null, $role);
                 $this->redirectToIndex("UsersManager", "userSecurity");
             }
         } else {
@@ -291,33 +290,29 @@ class Controller extends \Piwik\Plugin\Controller
     }
 
     /**
-     * Fetch user role from external JSON source.
-     *
-     * @param string $username
-     * @return string
-     */
-    private function getRoleFromExternalSource(string $username): string
+ * Map OIDC groups to roles.
+ *
+ * @param array $groups
+ * @return string
+ */
+    private function mapGroupsToRole(array $groups): string
     {
-        $jsonString = file_get_contents('/path/to/external/roles.json'); // Path to your JSON file
-        $data = json_decode($jsonString, true);
+        // Define your group-to-role mapping
+        $groupRoleMap = [
+            'reader-all' => 'reader',
+            'contributor-all' => 'editor',
+            'administrator-all' => 'administrator',
+        ];
 
-        if (!isset($data['users'])) {
-            error_log("No users found in JSON");
-            return 'reader'; // Default to 'reader' role
-        }
-
-        foreach ($data['users'] as $user) {
-            if (strtolower($user['username']) === strtolower($username)) {
-                return strtolower($user['role']); // Return role from JSON
+        foreach ($groups as $group) {
+            if (isset($groupRoleMap[$group])) {
+                return $groupRoleMap[$group];
             }
         }
 
-        error_log("No role found for user {$username}. Defaulting to 'reader'.");
-        return 'reader'; // Default role if user not found
+        // Default to 'reader' if no matching group is found
+        return 'reader';
     }
-
-
-
     /**
      * Check whether the given user has superuser access.
      * The function in Piwik\Core cannot be used because it requires an admin user being signed in.
@@ -432,7 +427,6 @@ class Controller extends \Piwik\Plugin\Controller
             throw $e;
         }
     }
-    
     
 
     /**
