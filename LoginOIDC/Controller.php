@@ -147,46 +147,6 @@ class Controller extends \Piwik\Plugin\Controller
      *
      * @return void
      */
-    public function signin()
-    {
-        $settings = new \Piwik\Plugins\LoginOIDC\SystemSettings();
-
-        $allowedMethods = array("POST");
-        if (!$settings->disableDirectLoginUrl->getValue()) {
-            array_push($allowedMethods, "GET");
-        }
-        if (!in_array($_SERVER["REQUEST_METHOD"], $allowedMethods)) {
-            throw new Exception(Piwik::translate("LoginOIDC_MethodNotAllowed"));
-        }
-
-        if ($_SERVER["REQUEST_METHOD"] === "POST") {
-            // csrf protection
-            Nonce::checkNonce(self::OIDC_NONCE, $_POST["form_nonce"]);
-        }
-
-        if (!$this->isPluginSetup($settings)) {
-            throw new Exception(Piwik::translate("LoginOIDC_ExceptionNotConfigured"));
-        }
-
-        $_SESSION["loginoidc_state"] = $this->generateKey(32);
-        $params = array(
-            "client_id" => $settings->clientId->getValue(),
-            "scope" => $settings->scope->getValue(),
-            "redirect_uri"=> $this->getRedirectUri(),
-            "state" => $_SESSION["loginoidc_state"],
-            "response_type" => "code"
-        );
-        $url = $settings->authorizeUrl->getValue();
-        $url .= (parse_url($url, PHP_URL_QUERY) ? "&" : "?") . http_build_query($params);
-        Url::redirectToUrl($url);
-    }
-
-    /**
-     * Handle callback from oauth service.
-     * Verify callback code, exchange for authorization token and fetch userinfo.
-     *
-     * @return void
-     */
     public function callback()
     {
         error_log("LoginOIDC: Starting callback process...");
@@ -278,6 +238,8 @@ class Controller extends \Piwik\Plugin\Controller
             $roles = $userInfo['dot-jenkins-bot-authorisation'] ?? [];
             if (empty($roles)) {
                 error_log("LoginOIDC: No roles found in Keycloak claims.");
+            } else {
+                error_log("LoginOIDC: Roles found in Keycloak claims: " . json_encode($roles));
             }
 
             // Check if external JSON roles are included in the token
@@ -335,6 +297,7 @@ class Controller extends \Piwik\Plugin\Controller
             throw $e;
         }
     }
+
 
 
 
